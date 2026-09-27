@@ -1,6 +1,6 @@
 # 本地水质采样事件 API
 
-使用 FastAPI + SQLite 实现。客户端以批量方式提交设备浊度采样；服务端按 `(device_id, sequence)` 去重，允许乱序和迟到记录，通过“告警阈值 + 恢复阈值”的滞回规则维护连续浊度告警事件，并按最大采样间隔识别观测中断。已入库的误测记录可通过更正接口在校验旧值后修改采样时间与浊度，并同步重算该设备的告警事件。每次成功的写入、重放或更正还会在同一事务内向**增量事件变更流**追加按事件比对出的差异（`upsert` / `delete`），供下游以“快照 + 变更流”方式复制事件。运维人员可对当前版本的事件做**人工确认**；确认随事件版本失效，且不影响变更流。此外还提供多设备**共同告警查询**，找出指定时间窗内同时处于告警状态的设备数达到阈值的连续区段；**事件证据查询**，按采样列出当前告警事件由哪些观测形成；单设备**超阈浊度累积查询**，按时间窗对原始采样做线性插值，累计浊度超过指定阈值的时长与面积；以及单设备**采样计划符合度查询**，按 `from + k×interval` 生成计划时刻，在一次只读快照中把原始采样与各时刻做一对一最优匹配，返回每点命中的采样与偏差或缺测标记。最后提供 `POST /maintenance/backup` **备份下载**接口：通过 SQLite 在线备份接口生成单个已提交快照，打包 `water.db` 与记录结构版本、业务表行数、最大 `change_id` 和 SHA-256 的 `manifest.json`，可按原配置离线恢复。
+使用 FastAPI + SQLite 实现。客户端以批量方式提交设备浊度采样；服务端按 `(device_id, sequence)` 去重，允许乱序和迟到记录，通过“告警阈值 + 恢复阈值”的滞回规则维护连续浊度告警事件，并按最大采样间隔识别观测中断。已入库的误测记录可通过更正接口在校验旧值后修改采样时间与浊度，并同步重算该设备的告警事件。每次成功的写入、重放或更正还会在同一事务内向**增量事件变更流**追加按事件比对出的差异（`upsert` / `delete`），供下游以“快照 + 变更流”方式复制事件。运维人员可对当前版本的事件做**人工确认**；确认随事件版本失效，且不影响变更流。此外还提供多设备**共同告警查询**，找出指定时间窗内同时处于告警状态的设备数达到阈值的连续区段；**事件证据查询**，按采样列出当前告警事件由哪些观测形成；单设备**超阈浊度累积查询**，按时间窗对原始采样做线性插值，累计浊度超过指定阈值的时长与面积；以及单设备**采样计划符合度查询**，按 `from + k×interval` 生成计划时刻，在一次只读快照中把原始采样与各时刻做一对一最优匹配，返回每点命中的采样与偏差或缺测标记。运维侧还提供 `POST /maintenance/alarm-rule-preview` **告警规则预览**：给定候选的告警阈值、恢复阈值与最大采样间隔，在一次只读快照中对 1～20 个互异设备用与写入路径完全相同的 `(sampled_at, sequence)` 顺序、滞回与缺口规则推演候选事件，并按 `event_id` 给出相对当前事件的新增、字段变化（同时给出新旧两版事件，同值事件不计入）与消失项；预览不改动任何生效配置或数据。最后提供 `POST /maintenance/backup` **备份下载**接口：通过 SQLite 在线备份接口生成单个已提交快照，打包 `water.db` 与记录结构版本、业务表行数、最大 `change_id` 和 SHA-256 的 `manifest.json`，可按原配置离线恢复。
 
 ## 一条命令启动
 
@@ -611,6 +611,103 @@ WATER_DATABASE_PATH=./water.db uvicorn app.main:app
 
 恢复后可这样核对：`GET /devices/{device_id}/events` 能查到备份时刻的事件，`GET /event-changes` 的 `head_change_id` 等于清单中的 `max_change_id`，之后的新写入仍从该水位连续追加，无空洞。若恢复时环境变量里的阈值或 `WATER_MAX_SAMPLE_GAP_SECONDS` 与备份库持久化的值不同，启动会与往常一样按当前配置重算派生事件（原始采样、变更流、确认行都保留）。
 
+### 13. 维护：预览告警规则
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/maintenance/alarm-rule-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_ids": ["sensor-01", "sensor-02"],
+    "alarm_threshold": 12.0,
+    "recovery_threshold": 6.0,
+    "max_sample_gap_seconds": 300
+  }'
+```
+
+在不改动任何生效配置与数据的前提下，预览把告警阈值、恢复阈值和最大采样间隔换成候选值后，指定设备的告警事件会如何变化。请求体：
+
+| 字段 | 约束 |
+|---|---|
+| `device_ids` | 1～20 个**互异**设备 ID（与写入接口一样去除首尾空白，去空白后仍须非空且两两不同） |
+| `alarm_threshold` | 非负有限数：候选告警阈值，浊度 `>=` 它进入告警 |
+| `recovery_threshold` | 非负有限数：候选恢复阈值，已告警时浊度 `<=` 它恢复 |
+| `max_sample_gap_seconds` | 正整数：候选的相邻采样最大允许间隔（秒） |
+
+还要求 `alarm_threshold > recovery_threshold`（相等也不允许，滞回必须无歧义）。任一约束不满足（缺字段、多字段、设备数越界、ID 为空或重复、阈值为负/非有限值/告警阈值不大于恢复阈值、间隔非正整数）返回 `422`。**未知设备不报错**，其当前事件、候选事件与各项差异均为空列表。
+
+所有请求设备的原始采样、当前已提交事件与当前生效规则在**同一个只读快照**中读取；候选事件由与写入路径完全相同的确定性滞回状态机推演：采样仍按 `(sampled_at, sequence)` 升序消费（同刻采样按序列号决胜），告警触发用 `>= alarm_threshold`、恢复用 `<= recovery_threshold`，相邻采样间隔严格大于 `max_sample_gap_seconds` 时事件在上一个采样处标记 `interrupted`（间隔恰好等于上限时仍连续）。快照之后提交的写入由下一次预览反映。
+
+设备按 `device_id` 字典序排列，每个设备给出：
+
+- `current_events` / `candidate_events`：当前生效规则下的事件与候选规则下推演出的事件，均按 `event_id` 字符串排序；
+- `added`：候选中有、当前没有相同 `event_id` 的事件（新增项）；
+- `field_changes`：`event_id` 相同但任一字段不同的事件（字段变化），每项同时给出 `current_event`（旧事件）与 `candidate_event`（新事件）；逐字段完全相同的事件**不列入**——即使候选规则与当前规则不同，只要推演结果一致，该设备就没有任何差异；
+- `removed`：当前有、候选中没有相同 `event_id` 的事件（消失项）。
+
+事件身份仍是 `evt:{URL 编码后的 device_id}:{start_sequence}`：候选阈值改变会使事件起点移动，表现为旧 `event_id` 消失、新 `event_id` 新增；同一个起点序列的事件只是在状态、起止或峰值等字段上变化时，表现为字段变化。顶层 `current_rules` 是快照中实际生效的规则（即当前 `/thresholds` 的值），`candidate_rules` 原样回显请求中的候选规则；`device_ids` 按设备排序回显。
+
+响应示例（基于[第 1 节](#1-写入记录)写入的四条采样，当前规则为 10/5、600 秒；候选规则为 8/2、600 秒，4.0 落入滞回区，事件由 `recovered` 变为仍在持续）：
+
+```json
+{
+  "device_ids": ["sensor-01"],
+  "current_rules": {
+    "alarm_threshold": 10.0,
+    "recovery_threshold": 5.0,
+    "max_sample_gap_seconds": 600
+  },
+  "candidate_rules": {
+    "alarm_threshold": 8.0,
+    "recovery_threshold": 2.0,
+    "max_sample_gap_seconds": 600
+  },
+  "devices": [
+    {
+      "device_id": "sensor-01",
+      "current_events": [
+        {
+          "event_id": "evt:sensor-01:2",
+          "device_id": "sensor-01",
+          "status": "recovered",
+          "start_sequence": 2,
+          "end_sequence": 4,
+          "start_at": "2026-09-23T08:01:00Z",
+          "end_at": "2026-09-23T08:03:00Z",
+          "peak_turbidity": 12.0,
+          "peak_sequence": 2,
+          "sample_count": 3
+        }
+      ],
+      "candidate_events": [
+        {
+          "event_id": "evt:sensor-01:2",
+          "device_id": "sensor-01",
+          "status": "active",
+          "start_sequence": 2,
+          "end_sequence": null,
+          "start_at": "2026-09-23T08:01:00Z",
+          "end_at": null,
+          "peak_turbidity": 12.0,
+          "peak_sequence": 2,
+          "sample_count": 3
+        }
+      ],
+      "added": [],
+      "field_changes": [
+        {
+          "event_id": "evt:sensor-01:2",
+          "current_event": { "event_id": "evt:sensor-01:2", "status": "recovered", "end_sequence": 4, "...": "旧事件完整字段" },
+          "candidate_event": { "event_id": "evt:sensor-01:2", "status": "active", "end_sequence": null, "...": "新事件完整字段" }
+        }
+      ],
+      "removed": []
+    }
+  ]
+}
+```
+
+预览是**只读**的：不会把候选规则写入生效配置（`GET /thresholds` 不变，启动配置也不变），不写入或重算采样与事件，不撤销任何人工确认，也不追加变更流（不产生 `/event-changes` 记录）；确认状态本身不出现在预览载荷中。Docker Compose 启动方式无需任何变化。
+
 ## 数据库升级与迁移
 
 `events` 表是 `samples` 原始采样的纯派生数据。服务启动时比对 `schema_meta` 中持久化的 `schema_version` 与代码版本：
@@ -660,5 +757,6 @@ pytest -q
 - `GET /devices/{device_id}/events/{event_id}/evidence` 是只读查询：在一次只读事务快照中同时读取事件、生效阈值与该设备原始采样，并用写入路径同一个状态机定位成员，不写入事件、确认，也不追加变更流。迟到写入、更正或配置变更后下一次查询即反映最新证据，事件消失则返回 `404`。
 - `POST /devices/{device_id}/turbidity-exposure` 是只读查询：在一次只读快照中读取该设备原始采样与当前最大采样间隔，按线性插值累计超阈时长与面积，不写入采样、事件、确认，也不追加变更流。迟到写入或更正提交后，下一次查询即反映新结果。
 - `POST /devices/{device_id}/sampling-adherence` 是只读查询：在一次只读快照中读取该设备原始采样，按 `from + k×interval`（严格早于 `to`，至多 200 个）生成计划时刻并做一对一最优匹配（先最大化命中数、再最小化偏差绝对值总和、最后按 `(计划时刻, sampled_at, sequence)` 字典序决胜），不写入采样、事件、确认，也不追加变更流。迟到写入或更正提交后，下一次查询即反映新结果。
+- `POST /maintenance/alarm-rule-preview` 是只读查询：在一次只读快照中读取各请求设备的原始采样、当前事件与当前生效规则，用写入路径同一个状态机（`(sampled_at, sequence)` 顺序、滞回与缺口规则）按候选阈值与间隔推演候选事件，再按 `event_id` 比较出新增、字段变化（新旧两版事件并列，同值事件不计入）与消失项；不写入生效配置、采样、事件或确认，也不追加变更流，确认状态不出现在载荷中。未知设备返回空结果。
 - 升级时 `schema_version` 与事件重算在同一事务提交；升级任一阶段中断后重启会自动重新迁移，从原始采样恢复全部派生事件。`event_changes` 与 `event_acks` 表都不是派生缓存，升级时不会被丢弃。
 - `POST /maintenance/backup` 是只读维护接口：通过 SQLite 在线备份接口把单个已提交快照复制到临时文件，随后执行 `PRAGMA integrity_check`，校验为 `ok` 才连同从备份库读出的 `manifest.json`（结构版本、四张业务表行数、最大 `change_id`、`water.db` 的 SHA-256）打包下载。备份不写入在线库；与采样写入、迟到重算、更正或确认并发时包内数据不跨事务混合。校验或打包失败时返回 `500` 并清理临时文件，不发送半成品。下载到的 `water.db` 放到 `WATER_DATABASE_PATH` 即可启动并查询原有数据。

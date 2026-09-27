@@ -494,6 +494,104 @@ class ThresholdsOut(BaseModel):
     max_sample_gap_seconds: int
 
 
+class AlarmRulePreviewIn(BaseModel):
+    """Hypothetical alarm-rule preview over 1..20 distinct devices.
+
+    ``device_ids`` holds 1..20 distinct device ids (whitespace-stripped and
+    required to be non-empty, matching the write path's device id handling,
+    and pairwise distinct after that normalization). The candidate
+    ``alarm_threshold``/``recovery_threshold`` are non-negative finite and
+    the alarm threshold must be strictly greater than the recovery
+    threshold so the hysteresis is unambiguous; ``max_sample_gap_seconds``
+    is a positive integer. Nothing in the request is ever persisted.
+    """
+
+    device_ids: list[str] = Field(min_length=1, max_length=20)
+    alarm_threshold: float = Field(ge=0.0, examples=[12.0])
+    recovery_threshold: float = Field(ge=0.0, examples=[6.0])
+    max_sample_gap_seconds: int = Field(gt=0, examples=[600])
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("device_ids")
+    @classmethod
+    def require_distinct_devices(cls, value: list[str]) -> list[str]:
+        normalized = [_stripped_device_id(item) for item in value]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("device_ids must be distinct")
+        return normalized
+
+    @field_validator("alarm_threshold", "recovery_threshold")
+    @classmethod
+    def reject_non_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("threshold must be a finite number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "AlarmRulePreviewIn":
+        if self.alarm_threshold <= self.recovery_threshold:
+            raise ValueError(
+                "alarm_threshold must be greater than recovery_threshold"
+            )
+        return self
+
+
+class AlarmRuleRulesOut(BaseModel):
+    """One effective or candidate set of alarm-rule parameters."""
+
+    alarm_threshold: float
+    recovery_threshold: float
+    max_sample_gap_seconds: int
+
+
+class AlarmRuleFieldChangeOut(BaseModel):
+    """One event whose event_id survives but whose fields differ.
+
+    Both the current stored event (``current_event``) and the event derived
+    under the candidate rule (``candidate_event``) are returned; events
+    equal field by field never appear here.
+    """
+
+    event_id: str
+    current_event: EventOut
+    candidate_event: EventOut
+
+
+class AlarmRuleDevicePreviewOut(BaseModel):
+    """One device's current vs. candidate event sets and their difference.
+
+    Both event lists and every diff list are ordered by event_id; devices
+    in the enclosing response are ordered lexicographically by device_id.
+    ``added`` lists candidate events with no current event of the same
+    event_id; ``field_changes`` lists same-event-id pairs with differing
+    fields (both versions included); ``removed`` lists current events with
+    no candidate event of the same event_id. A device without samples gets
+    empty lists throughout.
+    """
+
+    device_id: str
+    current_events: list[EventOut]
+    candidate_events: list[EventOut]
+    added: list[EventOut]
+    field_changes: list[AlarmRuleFieldChangeOut]
+    removed: list[EventOut]
+
+
+class AlarmRulePreviewOut(BaseModel):
+    """Result of a read-only what-if preview under candidate alarm rules.
+
+    ``current_rules`` are the rules stored in schema_meta at the snapshot
+    and ``candidate_rules`` echo the request; ``devices`` carries one
+    entry per requested (normalized) device id in lexicographic order.
+    """
+
+    device_ids: list[str]
+    current_rules: AlarmRuleRulesOut
+    candidate_rules: AlarmRuleRulesOut
+    devices: list[AlarmRuleDevicePreviewOut]
+
+
 class ConflictError(Exception):
     def __init__(self, detail: str) -> None:
         super().__init__(detail)

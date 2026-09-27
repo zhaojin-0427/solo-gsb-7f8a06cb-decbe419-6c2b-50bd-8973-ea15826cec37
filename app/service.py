@@ -14,6 +14,11 @@ from .backup import BackupArchive, build_backup_archive
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
+    AlarmRuleDevicePreviewOut,
+    AlarmRuleFieldChangeOut,
+    AlarmRulePreviewIn,
+    AlarmRulePreviewOut,
+    AlarmRuleRulesOut,
     BatchIn,
     BatchOut,
     CoincidentAlarmsIn,
@@ -886,6 +891,125 @@ class WaterQualityService:
             planned_count=len(planned_us),
             hit_count=len(matches),
             points=points,
+        )
+
+    def preview_alarm_rules(
+        self, payload: AlarmRulePreviewIn
+    ) -> AlarmRulePreviewOut:
+        """Preview how candidate alarm rules would reshape each device's events.
+
+        One read-only snapshot fetches, for every requested device, both its
+        raw samples (in (sampled_at, sequence) order) and its current stored
+        events, together with the currently effective rule parameters
+        persisted in schema_meta. The candidate events are then derived with
+        the exact same deterministic hysteresis state machine, gap rules and
+        ordering the write path uses, but with the request's thresholds and
+        max sample gap.
+
+        The two event sets are compared by event_id per device: candidate
+        events with no same-id current event are ``added``; same-id events
+        differing in any field are ``field_changes`` (both versions
+        included, so equal events are never listed); current events with no
+        same-id candidate event are ``removed``. Devices without samples
+        simply get empty lists. The preview never writes the effective
+        configuration, samples, events, acknowledgements or change-stream
+        rows; writes committed after the snapshot are reflected by the next
+        preview.
+        """
+        device_ids = sorted(payload.device_ids)
+        with self._write_lock, db.read_transaction(self._connection):
+            current_rules = AlarmRuleRulesOut(
+                alarm_threshold=float(
+                    db.get_meta(self._connection, META_ALARM)
+                    or self._settings.alarm_threshold
+                ),
+                recovery_threshold=float(
+                    db.get_meta(self._connection, META_RECOVERY)
+                    or self._settings.recovery_threshold
+                ),
+                max_sample_gap_seconds=int(
+                    db.get_meta(self._connection, META_MAX_SAMPLE_GAP)
+                    or self._settings.max_sample_gap_seconds
+                ),
+            )
+
+            device_previews: list[AlarmRuleDevicePreviewOut] = []
+            for device_id in device_ids:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE device_id = ?
+                    """,
+                    (device_id,),
+                ).fetchall()
+                current_events = sorted(
+                    (self._row_to_event(row) for row in rows),
+                    key=lambda event: event.event_id,
+                )
+                samples = self._load_raw_samples(device_id)
+                candidate_events = sorted(
+                    (
+                        event.to_event_out(device_id)
+                        for event in self._derive_device_events(
+                            device_id,
+                            samples,
+                            alarm_threshold=payload.alarm_threshold,
+                            recovery_threshold=payload.recovery_threshold,
+                            max_sample_gap_seconds=(
+                                payload.max_sample_gap_seconds
+                            ),
+                        )
+                    ),
+                    key=lambda event: event.event_id,
+                )
+
+                current_by_id = {
+                    event.event_id: event for event in current_events
+                }
+                candidate_by_id = {
+                    event.event_id: event for event in candidate_events
+                }
+                added = [
+                    event
+                    for event in candidate_events
+                    if event.event_id not in current_by_id
+                ]
+                removed = [
+                    event
+                    for event in current_events
+                    if event.event_id not in candidate_by_id
+                ]
+                field_changes = [
+                    AlarmRuleFieldChangeOut(
+                        event_id=event_id,
+                        current_event=current_by_id[event_id],
+                        candidate_event=candidate_by_id[event_id],
+                    )
+                    for event_id in sorted(
+                        set(current_by_id) & set(candidate_by_id)
+                    )
+                    if current_by_id[event_id] != candidate_by_id[event_id]
+                ]
+                device_previews.append(
+                    AlarmRuleDevicePreviewOut(
+                        device_id=device_id,
+                        current_events=current_events,
+                        candidate_events=candidate_events,
+                        added=added,
+                        field_changes=field_changes,
+                        removed=removed,
+                    )
+                )
+
+        return AlarmRulePreviewOut(
+            device_ids=device_ids,
+            current_rules=current_rules,
+            candidate_rules=AlarmRuleRulesOut(
+                alarm_threshold=payload.alarm_threshold,
+                recovery_threshold=payload.recovery_threshold,
+                max_sample_gap_seconds=payload.max_sample_gap_seconds,
+            ),
+            devices=device_previews,
         )
 
     @staticmethod

@@ -17,6 +17,8 @@ from .backup import BackupError
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
+    AlarmRulePreviewIn,
+    AlarmRulePreviewOut,
     BatchIn,
     BatchOut,
     CoincidentAlarmsIn,
@@ -176,6 +178,39 @@ def create_backup(
         filename=archive.path.name,
         background=BackgroundTask(_remove_file, str(archive.path)),
     )
+
+
+@app.post(
+    "/maintenance/alarm-rule-preview",
+    response_model=AlarmRulePreviewOut,
+    tags=["maintenance"],
+)
+def alarm_rule_preview(
+    payload: AlarmRulePreviewIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> AlarmRulePreviewOut:
+    """
+    Preview what the committed alarm events would look like under candidate
+    rule parameters.
+
+    The request names 1..20 distinct device ids and a candidate alarm
+    threshold, recovery threshold and maximum sample gap. Both thresholds
+    must be non-negative finite numbers with the alarm threshold strictly
+    greater than the recovery threshold, and the gap must be a positive
+    integer; any violation returns 422. One read-only snapshot fetches
+    every device's raw samples and current stored events plus the currently
+    effective rule, and the same deterministic hysteresis state machine as
+    the write path derives the candidate events in (sampled_at, sequence)
+    order, including the hysteresis band and the observation-gap
+    interruption rules. For each device (ordered lexicographically), the
+    response returns the current and candidate rule parameters, the current
+    and candidate events ordered by event_id, and the relative difference:
+    added events, same-event-id field changes (with both the old and the new
+    event; equal events are omitted) and removed events. Unknown devices
+    return empty event lists. The preview never modifies the effective
+    configuration, samples, events, acknowledgements or the change stream.
+    """
+    return service.preview_alarm_rules(payload)
 
 
 @app.get("/thresholds", response_model=ThresholdsOut, tags=["config"])
