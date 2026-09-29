@@ -14,6 +14,10 @@ from .backup import BackupArchive, build_backup_archive
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
+    AlarmRuleChangeOut,
+    AlarmRulePreviewDeviceOut,
+    AlarmRulePreviewIn,
+    AlarmRulePreviewOut,
     BatchIn,
     BatchOut,
     CoincidentAlarmsIn,
@@ -163,6 +167,144 @@ class WaterQualityService:
             alarm_threshold=self._settings.alarm_threshold,
             recovery_threshold=self._settings.recovery_threshold,
             max_sample_gap_seconds=self._settings.max_sample_gap_seconds,
+        )
+
+    def preview_alarm_rule(
+        self, payload: AlarmRulePreviewIn
+    ) -> AlarmRulePreviewOut:
+        """Preview the events a candidate alarm rule would derive.
+
+        The effective rule, every requested device's committed events and
+        all of its raw samples are read from one consistent read-only
+        snapshot. The candidate rule from the request is then applied to
+        the raw samples through the exact same deterministic
+        (sampled_at, sequence) ordering, hysteresis and gap state machine
+        as the write path. The current and candidate event sets are
+        compared by event_id: ids only under the candidate rule are
+        ``added``, ids only in the current set are ``removed``, and ids
+        present on both sides but differing in any field are ``changed``
+        with both the old and the new event embedded; field-by-field
+        identical events are not reported. Unknown devices simply return
+        empty lists. Nothing here writes the effective config, samples,
+        events, acknowledgements or change-stream rows.
+        """
+        candidate_rule = ThresholdsOut(
+            alarm_threshold=payload.alarm_threshold,
+            recovery_threshold=payload.recovery_threshold,
+            max_sample_gap_seconds=payload.max_sample_gap_seconds,
+        )
+        device_ids = sorted(payload.device_ids)
+
+        device_results: list[AlarmRulePreviewDeviceOut] = []
+        with self._write_lock, db.read_transaction(self._connection):
+            current_rule = ThresholdsOut(
+                alarm_threshold=float(
+                    db.get_meta(self._connection, META_ALARM)
+                    or self._settings.alarm_threshold
+                ),
+                recovery_threshold=float(
+                    db.get_meta(self._connection, META_RECOVERY)
+                    or self._settings.recovery_threshold
+                ),
+                max_sample_gap_seconds=int(
+                    db.get_meta(self._connection, META_MAX_SAMPLE_GAP)
+                    or self._settings.max_sample_gap_seconds
+                ),
+            )
+
+            for device_id in device_ids:
+                current_rows = self._connection.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE device_id = ?
+                    ORDER BY event_id
+                    """,
+                    (device_id,),
+                ).fetchall()
+                current_events = sorted(
+                    (self._row_to_event(row) for row in current_rows),
+                    key=lambda event: event.event_id,
+                )
+                samples = self._load_raw_samples(device_id)
+                derived = self._derive_device_events(
+                    device_id,
+                    samples,
+                    alarm_threshold=payload.alarm_threshold,
+                    recovery_threshold=payload.recovery_threshold,
+                    max_sample_gap_seconds=payload.max_sample_gap_seconds,
+                )
+                candidate_events = sorted(
+                    (
+                        event.to_event_out(device_id)
+                        for event in derived
+                    ),
+                    key=lambda event: event.event_id,
+                )
+                device_results.append(
+                    self._diff_rule_preview(
+                        device_id, current_events, candidate_events
+                    )
+                )
+
+        return AlarmRulePreviewOut(
+            device_ids=device_ids,
+            current_rule=current_rule,
+            candidate_rule=candidate_rule,
+            devices=device_results,
+        )
+
+    @staticmethod
+    def _diff_rule_preview(
+        device_id: str,
+        current_events: list[EventOut],
+        candidate_events: list[EventOut],
+    ) -> AlarmRulePreviewDeviceOut:
+        """Compare one device's current events with the candidate's.
+
+        The three result lists are ordered by event_id; an event present
+        and field-by-field equal on both sides appears nowhere, so a
+        preview against the effective rule returns empty differences.
+        """
+        current = {event.event_id: event for event in current_events}
+        candidate = {event.event_id: event for event in candidate_events}
+
+        added: list[AlarmRuleChangeOut] = [
+            AlarmRuleChangeOut(
+                change_type="added",
+                event_id=event_id,
+                old_event=None,
+                new_event=candidate[event_id],
+            )
+            for event_id in sorted(candidate)
+            if event_id not in current
+        ]
+        removed: list[AlarmRuleChangeOut] = [
+            AlarmRuleChangeOut(
+                change_type="removed",
+                event_id=event_id,
+                old_event=current[event_id],
+                new_event=None,
+            )
+            for event_id in sorted(current)
+            if event_id not in candidate
+        ]
+        changed: list[AlarmRuleChangeOut] = [
+            AlarmRuleChangeOut(
+                change_type="changed",
+                event_id=event_id,
+                old_event=current[event_id],
+                new_event=candidate[event_id],
+            )
+            for event_id in sorted(set(current) & set(candidate))
+            if current[event_id] != candidate[event_id]
+        ]
+        return AlarmRulePreviewDeviceOut(
+            device_id=device_id,
+            current_events=current_events,
+            candidate_events=candidate_events,
+            added=added,
+            changed=changed,
+            removed=removed,
         )
 
     def ingest_batch(self, batch: BatchIn) -> BatchOut:

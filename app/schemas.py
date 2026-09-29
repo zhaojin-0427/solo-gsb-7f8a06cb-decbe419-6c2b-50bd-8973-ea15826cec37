@@ -226,6 +226,52 @@ class SamplingAdherenceIn(BaseModel):
         return self
 
 
+class AlarmRulePreviewIn(BaseModel):
+    """Hypothetical alarm-rule preview over 1..20 distinct devices.
+
+    The request carries the same three rule parameters the service runs
+    with: ``alarm_threshold``/``recovery_threshold`` are non-negative
+    finite numbers with ``alarm_threshold`` strictly greater than
+    ``recovery_threshold`` (the same ordering the effective config must
+    satisfy), and ``max_sample_gap_seconds`` is a positive integer.
+    ``device_ids`` holds 1..20 distinct ids, normalized the same way as
+    the write path (whitespace-stripped, non-empty, pairwise distinct).
+    The preview never applies these values; the stored config stays
+    untouched and only the response shows what the candidate rule would
+    derive.
+    """
+
+    device_ids: list[str] = Field(min_length=1, max_length=20)
+    alarm_threshold: float = Field(ge=0.0, examples=[8.0])
+    recovery_threshold: float = Field(ge=0.0, examples=[4.0])
+    max_sample_gap_seconds: int = Field(gt=0, examples=[300])
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("device_ids")
+    @classmethod
+    def require_distinct_devices(cls, value: list[str]) -> list[str]:
+        normalized = [_stripped_device_id(item) for item in value]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("device_ids must be distinct")
+        return normalized
+
+    @field_validator("alarm_threshold", "recovery_threshold")
+    @classmethod
+    def reject_non_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("threshold must be a finite number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "AlarmRulePreviewIn":
+        if self.alarm_threshold <= self.recovery_threshold:
+            raise ValueError(
+                "alarm_threshold must be greater than recovery_threshold"
+            )
+        return self
+
+
 class EventOut(BaseModel):
     event_id: str
     device_id: str
@@ -492,6 +538,69 @@ class ThresholdsOut(BaseModel):
     alarm_threshold: float
     recovery_threshold: float
     max_sample_gap_seconds: int
+
+
+class AlarmRuleChangeOut(BaseModel):
+    """One event difference a candidate rule would cause on one device.
+
+    The change kind discriminates the cases relative to the current event
+    set of the device:
+
+    - ``added``: an event_id present only under the candidate rule;
+      ``new_event`` carries the full candidate event and ``old_event`` is
+      null;
+    - ``changed``: the same event_id exists under both rules but one or
+      more fields differ; both ``old_event`` (current) and ``new_event``
+      (candidate) are embedded;
+    - ``removed``: an event_id present only under the current rule;
+      ``old_event`` carries the full current event and ``new_event`` is
+      null.
+
+    Events equal field by field under both rules are never listed; the
+    embedded events never carry the query-only acknowledgement flag.
+    """
+
+    change_type: Literal["added", "changed", "removed"]
+    event_id: str
+    old_event: EventOut | None
+    new_event: EventOut | None
+
+
+class AlarmRulePreviewDeviceOut(BaseModel):
+    """One requested device's current vs candidate-rule preview.
+
+    ``current_events`` are the committed events (sorted by event_id, like
+    every other list in the response); ``candidate_events`` result from
+    replaying the device's raw samples through the same deterministic
+    hysteresis/gap state machine under the requested rule. ``added``,
+    ``changed`` and ``removed`` partition the differences by event_id;
+    an unchanged event appears in neither list. Unknown devices simply
+    return empty lists.
+    """
+
+    device_id: str
+    current_events: list[EventOut]
+    candidate_events: list[EventOut]
+    added: list[AlarmRuleChangeOut]
+    changed: list[AlarmRuleChangeOut]
+    removed: list[AlarmRuleChangeOut]
+
+
+class AlarmRulePreviewOut(BaseModel):
+    """Result of a read-only what-if alarm-rule preview.
+
+    ``current_rule`` repeats the effective config and ``candidate_rule``
+    echoes the rule from the request; ``devices`` is ordered by device_id
+    and every per-device event list is ordered by event_id. The preview
+    is computed from one read-only snapshot and never modifies the
+    effective config, samples, events, acknowledgements or the change
+    stream.
+    """
+
+    device_ids: list[str]
+    current_rule: ThresholdsOut
+    candidate_rule: ThresholdsOut
+    devices: list[AlarmRulePreviewDeviceOut]
 
 
 class ConflictError(Exception):

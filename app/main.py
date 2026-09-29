@@ -17,6 +17,8 @@ from .backup import BackupError
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
+    AlarmRulePreviewIn,
+    AlarmRulePreviewOut,
     BatchIn,
     BatchOut,
     CoincidentAlarmsIn,
@@ -183,6 +185,37 @@ def thresholds(
     service: Annotated[WaterQualityService, Depends(get_service)],
 ) -> ThresholdsOut:
     return service.get_thresholds()
+
+
+@app.post(
+    "/maintenance/alarm-rule-preview",
+    response_model=AlarmRulePreviewOut,
+    tags=["maintenance"],
+)
+def alarm_rule_preview(
+    payload: AlarmRulePreviewIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> AlarmRulePreviewOut:
+    """
+    Preview how a candidate alarm rule would change up to 20 devices.
+
+    The request carries non-negative finite alarm/recovery thresholds
+    with the alarm threshold strictly above the recovery threshold, a
+    positive integer maximum sample gap, and 1..20 distinct device ids;
+    any violation yields 422. The effective rule, the devices' committed
+    events and all of their raw samples are read from one consistent
+    read-only snapshot; the samples are replayed under the candidate
+    rule with the same (sampled_at, sequence) ordering, hysteresis and
+    gap rules as the write path. Each device returns its current and
+    candidate events plus the per-event differences: added events (new
+    event only), removed events (old event only) and changed events
+    (both old and new events); field-by-field equal events are omitted.
+    Devices and events are ordered by device_id respectively event_id;
+    unknown devices return empty results. The preview is strictly
+    read-only: the effective config, samples, events, acknowledgements
+    and the change stream are never modified.
+    """
+    return service.preview_alarm_rule(payload)
 
 
 @app.post(
